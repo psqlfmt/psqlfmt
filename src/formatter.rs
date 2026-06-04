@@ -37,6 +37,7 @@ enum Clause {
 struct ParenContext {
     indent: usize,
     multiline: bool,
+    insert_target_list: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +161,9 @@ impl<'a> Formatter<'a> {
                 if upper == "POLICY" {
                     self.in_policy_statement = true;
                 }
+                if upper == "CREATE" && self.try_emit_create_routine(tokens, &mut i, embedded) {
+                    continue;
+                }
                 if upper == "CREATE" && self.try_emit_create_trigger(tokens, &mut i, embedded) {
                     continue;
                 }
@@ -177,7 +181,7 @@ impl<'a> Formatter<'a> {
                     i += 1;
                     continue;
                 }
-                if self.try_emit_keyword(token, &upper, tokens.get(i + 1), embedded) {
+                if self.try_emit_keyword(token, &upper, tokens.get(i + 1), embedded, tokens, i) {
                     i += 1;
                     continue;
                 }
@@ -195,7 +199,7 @@ impl<'a> Formatter<'a> {
                 TokenKind::Punctuation(']') | TokenKind::Punctuation('}') => {
                     self.emit_close_bracket(&token.text)
                 }
-                TokenKind::Operator => self.emit_operator(token),
+                TokenKind::Operator => self.emit_operator(token, tokens.get(i + 1)),
                 TokenKind::Word
                 | TokenKind::Number
                 | TokenKind::String
@@ -213,6 +217,96 @@ impl<'a> Formatter<'a> {
             self.push_sig(token, token.text.clone());
             i += 1;
         }
+    }
+
+    fn try_emit_create_routine(&mut self, tokens: &[Token], i: &mut usize, embedded: bool) -> bool {
+        let start = *i;
+        let Some(end) = tokens[start..]
+            .iter()
+            .position(|token| token.is_punctuation(';'))
+            .map(|offset| start + offset)
+        else {
+            return false;
+        };
+
+        let statement = &tokens[start..end];
+        if statement.iter().any(|token| {
+            matches!(
+                token.kind,
+                TokenKind::LineComment
+                    | TokenKind::BlockComment
+                    | TokenKind::BlankLine
+                    | TokenKind::MetaCommand
+            )
+        }) {
+            return false;
+        }
+        if create_routine_clause_start(statement).is_none()
+            || find_top_level_word(statement, &["AS"], 1).is_none()
+        {
+            return false;
+        }
+
+        self.emit_create_routine_statement(statement);
+        self.emit_semicolon(embedded);
+        *i = end + 1;
+        true
+    }
+
+    fn emit_create_routine_statement(&mut self, statement: &[Token]) {
+        let Some(clause_start) = create_routine_clause_start(statement) else {
+            return;
+        };
+
+        let base_indent = self.statement_indent();
+        self.newline_if_needed();
+        self.emit_inline_tokens_line(
+            &statement[..clause_start],
+            base_indent,
+            TokenCaseContext::Normal,
+        );
+
+        let mut cursor = clause_start;
+        while cursor < statement.len() {
+            let next = find_next_routine_clause(statement, cursor + 1, statement.len());
+            self.emit_routine_clause(&statement[cursor..next], base_indent);
+            cursor = next;
+        }
+
+        self.clause = Clause::Other;
+        self.list_items_on_line = 0;
+    }
+
+    fn emit_routine_clause(&mut self, clause: &[Token], base_indent: usize) {
+        if clause.is_empty() {
+            return;
+        }
+
+        if let Some(dollar_index) = clause
+            .iter()
+            .position(|token| token.kind == TokenKind::DollarString)
+        {
+            self.emit_inline_tokens_line(
+                &clause[..dollar_index],
+                base_indent,
+                TokenCaseContext::Normal,
+            );
+            for token in &clause[..dollar_index] {
+                self.push_sig(token, token.text.clone());
+            }
+            self.indent = base_indent;
+            self.emit_dollar_string(&clause[dollar_index]);
+            if dollar_index + 1 < clause.len() {
+                self.emit_inline_tokens_line(
+                    &clause[dollar_index + 1..],
+                    base_indent,
+                    TokenCaseContext::Normal,
+                );
+            }
+            return;
+        }
+
+        self.emit_inline_tokens_line(clause, base_indent, TokenCaseContext::Normal);
     }
 
     fn try_emit_create_trigger(&mut self, tokens: &[Token], i: &mut usize, embedded: bool) -> bool {
@@ -670,8 +764,15 @@ impl<'a> Formatter<'a> {
         upper: &str,
         next: Option<&Token>,
         embedded: bool,
+        tokens: &[Token],
+        index: usize,
     ) -> bool {
-        if self.is_contextual_identifier(upper, next) || self.is_create_table_column_name(upper) {
+        if self.is_contextual_identifier(upper, next)
+            || self.is_create_table_column_name(upper)
+            || self.is_insert_target_column_name()
+            || self.is_values_identifier_list_item(upper, next)
+            || self.is_distinct_from_operator(upper)
+        {
             return false;
         }
 
@@ -744,7 +845,7 @@ impl<'a> Formatter<'a> {
             }
             "ON" if self.is_merge_context() => self.emit_clause_header(upper, Clause::Where),
             "ON" if self.clause == Clause::From => self.emit_join_on(token, next),
-            "AND" | "OR" => self.emit_boolean(token, next),
+            "AND" | "OR" => self.emit_boolean(token, next, tokens, index),
             "BETWEEN" => {
                 self.in_between = true;
                 self.emit_atom(token, next);
@@ -881,14 +982,26 @@ impl<'a> Formatter<'a> {
         self.clause = Clause::JoinOn;
     }
 
-    fn emit_boolean(&mut self, token: &Token, next: Option<&Token>) {
+    fn emit_boolean(
+        &mut self,
+        token: &Token,
+        next: Option<&Token>,
+        tokens: &[Token],
+        index: usize,
+    ) {
         if token.upper() == "AND" && self.in_between {
             self.in_between = false;
             self.emit_atom(token, next);
             return;
         }
         if self.plpgsql_body && !matches!(self.clause, Clause::Where | Clause::Having) {
-            self.emit_atom(token, next);
+            if self.plpgsql_boolean_exceeds_wrap_limit(tokens, index) {
+                self.newline();
+                self.indent = self.block_indent + self.parens.len() + 1;
+                self.write_word(token, next);
+            } else {
+                self.emit_atom(token, next);
+            }
             return;
         }
         if token.upper() == "OR" && self.last_upper_is("CREATE") {
@@ -1169,7 +1282,9 @@ impl<'a> Formatter<'a> {
         let ddl_list = self.starts_structural_ddl_list();
         let insert_list = self.starts_insert_structural_list();
         let policy_expression = self.is_policy_context() && self.last_upper_in(&["USING", "CHECK"]);
-        let breakable_group = ddl_list || insert_list || policy_expression;
+        let long_comma_group = self.paren_group_has_top_level_comma(tokens, index)
+            && self.paren_group_exceeds_wrap_limit(tokens, index);
+        let breakable_group = ddl_list || insert_list || policy_expression || long_comma_group;
         let filter_clause = self.last_upper_is("FILTER");
         let multiline = next_starts_query
             || filter_clause
@@ -1177,7 +1292,9 @@ impl<'a> Formatter<'a> {
 
         let previous_is_array_constructor = self.last_upper_is("ARRAY");
         let previous_is_callable = previous_is_array_constructor
-            || (!multiline
+            || (!ddl_list
+                && !insert_list
+                && !policy_expression
                 && self.last_significant().is_some_and(|last| {
                     last.kind == TokenKind::Word
                         && (!keywords::is_keyword(&last.upper) || keywords::is_function(&last.text))
@@ -1192,6 +1309,7 @@ impl<'a> Formatter<'a> {
         self.parens.push(ParenContext {
             indent: self.indent,
             multiline,
+            insert_target_list: self.starts_insert_target_column_list(),
         });
         self.delimiters.push(DelimiterContext {
             kind: DelimiterKind::Paren,
@@ -1234,21 +1352,44 @@ impl<'a> Formatter<'a> {
             self.options,
             TokenCaseContext::Normal,
         );
-        let current_line_len = self
-            .output
-            .rsplit('\n')
-            .next()
-            .map_or(0, |line| line.chars().count());
-        let leading_space =
-            usize::from(
-                !self.output.is_empty()
-                    && !self.last_output_is_newline()
-                    && !self.output.chars().last().is_some_and(|ch| {
-                        ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '.')
-                    }),
-            );
-        let limit = self.options.wrap_limit.unwrap_or(100);
-        current_line_len + leading_space + inline.chars().count() > limit
+        self.current_line_len() + self.leading_space_before_inline() + inline.chars().count()
+            > self.effective_wrap_limit()
+    }
+
+    fn paren_group_has_top_level_comma(&self, tokens: &[Token], index: usize) -> bool {
+        let Some(close_index) = matching_close_paren(tokens, index) else {
+            return true;
+        };
+
+        let mut depth = 0usize;
+        for token in &tokens[index + 1..close_index] {
+            match token.kind {
+                TokenKind::Punctuation('(')
+                | TokenKind::Punctuation('[')
+                | TokenKind::Punctuation('{') => depth += 1,
+                TokenKind::Punctuation(')')
+                | TokenKind::Punctuation(']')
+                | TokenKind::Punctuation('}') => depth = depth.saturating_sub(1),
+                TokenKind::Punctuation(',') if depth == 0 => return true,
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn paren_group_exceeds_wrap_limit(&self, tokens: &[Token], index: usize) -> bool {
+        let Some(close_index) = matching_close_paren(tokens, index) else {
+            return true;
+        };
+
+        let inline = format_inline_tokens(
+            &tokens[index..=close_index],
+            self.options,
+            TokenCaseContext::Normal,
+        );
+        self.current_line_len() + self.leading_space_before_inline() + inline.chars().count()
+            > self.effective_wrap_limit()
     }
 
     fn emit_close_paren(&mut self) {
@@ -1287,6 +1428,7 @@ impl<'a> Formatter<'a> {
         self.brackets.push(ParenContext {
             indent: self.indent,
             multiline,
+            insert_target_list: false,
         });
         self.delimiters.push(DelimiterContext {
             kind: DelimiterKind::Bracket,
@@ -1331,13 +1473,7 @@ impl<'a> Formatter<'a> {
             self.options,
             TokenCaseContext::Normal,
         );
-        let current_line_len = self
-            .output
-            .rsplit('\n')
-            .next()
-            .map_or(0, |line| line.chars().count());
-        let limit = self.options.wrap_limit.unwrap_or(100);
-        current_line_len + inline.chars().count() > limit
+        self.current_line_len() + inline.chars().count() > self.effective_wrap_limit()
     }
 
     fn pop_delimiter(&mut self, kind: DelimiterKind) {
@@ -1350,7 +1486,7 @@ impl<'a> Formatter<'a> {
         }
     }
 
-    fn emit_operator(&mut self, token: &Token) {
+    fn emit_operator(&mut self, token: &Token, next: Option<&Token>) {
         let op = token.text.as_str();
         match op {
             "<<" if self.plpgsql_body && (token.at_line_start || self.last_output_is_newline()) => {
@@ -1373,6 +1509,10 @@ impl<'a> Formatter<'a> {
             "::" => {
                 self.trim_trailing_spaces();
                 self.output.push_str("::");
+            }
+            "%" if next.is_some_and(is_plpgsql_percent_type_word) => {
+                self.trim_trailing_spaces();
+                self.output.push('%');
             }
             "!" if self.is_unary_operator() => {
                 self.trim_trailing_spaces();
@@ -1520,8 +1660,13 @@ impl<'a> Formatter<'a> {
                     "USING",
                 ]))
             || (upper == "DOMAIN" && !self.last_upper_in(&["CREATE", "ALTER", "DROP"]))
-            || self.is_create_table_column_name(&upper);
-        let word = if preserve_contextual_identifier {
+            || self.is_create_table_column_name(&upper)
+            || self.is_insert_target_column_name();
+        let word = if self.is_insert_target_column_name()
+            || self.is_values_identifier_list_item(&upper, next)
+        {
+            token.text.to_ascii_lowercase()
+        } else if preserve_contextual_identifier {
             token.text.clone()
         } else if next.is_some_and(|next| next.is_punctuation('('))
             && keywords::is_function(&token.lower())
@@ -1556,6 +1701,13 @@ impl<'a> Formatter<'a> {
         if self
             .last_significant()
             .is_some_and(|last| last.text == "::")
+        {
+            self.trim_trailing_spaces();
+            return;
+        }
+        if token.kind == TokenKind::Word
+            && is_plpgsql_percent_type_word(token)
+            && self.last_significant().is_some_and(|last| last.text == "%")
         {
             self.trim_trailing_spaces();
             return;
@@ -1735,6 +1887,13 @@ impl<'a> Formatter<'a> {
         self.parens.is_empty() && self.recent_upper_contains(&["INSERT"], 6)
     }
 
+    fn starts_insert_target_column_list(&self) -> bool {
+        self.parens.is_empty()
+            && self.recent_upper_contains(&["INSERT"], 6)
+            && self.recent_upper_contains(&["INTO"], 5)
+            && !self.recent_upper_contains(&["VALUES", "SELECT"], 5)
+    }
+
     fn statement_indent(&self) -> usize {
         self.parens
             .last()
@@ -1742,6 +1901,40 @@ impl<'a> Formatter<'a> {
             .map_or(self.block_indent + self.parens.len(), |context| {
                 context.indent + 1
             })
+    }
+
+    fn effective_wrap_limit(&self) -> usize {
+        self.options.wrap_limit.unwrap_or(100)
+    }
+
+    fn current_line_len(&self) -> usize {
+        self.output
+            .rsplit('\n')
+            .next()
+            .map_or(0, |line| line.chars().count())
+    }
+
+    fn leading_space_before_inline(&self) -> usize {
+        usize::from(
+            !self.output.is_empty()
+                && !self.last_output_is_newline()
+                && !self
+                    .output
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '.')),
+        )
+    }
+
+    fn inline_tokens_exceed_wrap_limit(&self, tokens: &[Token]) -> bool {
+        let inline = format_inline_tokens(tokens, self.options, TokenCaseContext::Normal);
+        self.current_line_len() + self.leading_space_before_inline() + inline.chars().count()
+            > self.effective_wrap_limit()
+    }
+
+    fn plpgsql_boolean_exceeds_wrap_limit(&self, tokens: &[Token], index: usize) -> bool {
+        let end = find_plpgsql_boolean_segment_end(tokens, index + 1);
+        self.inline_tokens_exceed_wrap_limit(&tokens[index..end])
     }
 
     fn is_create_table_column_name(&self, upper: &str) -> bool {
@@ -1763,6 +1956,33 @@ impl<'a> Formatter<'a> {
                 TokenKind::Punctuation('(') | TokenKind::Punctuation(',')
             )
         })
+    }
+
+    fn is_insert_target_column_name(&self) -> bool {
+        self.parens
+            .last()
+            .is_some_and(|context| context.insert_target_list)
+    }
+
+    fn is_distinct_from_operator(&self, upper: &str) -> bool {
+        upper == "FROM" && self.last_upper_is("DISTINCT")
+    }
+
+    fn is_values_identifier_list_item(&self, upper: &str, next: Option<&Token>) -> bool {
+        if upper != "VALUES" || !matches!(self.clause, Clause::Select | Clause::Returning) {
+            return false;
+        }
+
+        let starts_list_item = self.last_significant().is_some_and(|last| {
+            last.kind == TokenKind::Punctuation(',')
+                || matches!(last.upper.as_str(), "SELECT" | "RETURNING")
+        });
+        let ends_list_item = next.is_none_or(|next| {
+            next.is_punctuation(',')
+                || (next.is_word() && matches!(next.upper().as_str(), "FROM" | "AS"))
+        });
+
+        starts_list_item && ends_list_item
     }
 
     fn is_contextual_identifier(&self, upper: &str, next: Option<&Token>) -> bool {
@@ -1907,6 +2127,102 @@ fn find_top_level_word(tokens: &[Token], words: &[&str], start: usize) -> Option
         }
     }
     None
+}
+
+fn create_routine_clause_start(tokens: &[Token]) -> Option<usize> {
+    if !tokens
+        .first()
+        .is_some_and(|token| token.is_word() && token.upper() == "CREATE")
+    {
+        return None;
+    }
+
+    let mut routine_index = 1usize;
+    if tokens
+        .get(routine_index)
+        .is_some_and(|token| token.is_word() && token.upper() == "OR")
+        && tokens
+            .get(routine_index + 1)
+            .is_some_and(|token| token.is_word() && token.upper() == "REPLACE")
+    {
+        routine_index += 2;
+    }
+
+    if !tokens.get(routine_index).is_some_and(|token| {
+        token.is_word() && matches!(token.upper().as_str(), "FUNCTION" | "PROCEDURE")
+    }) {
+        return None;
+    }
+
+    let clause_start = find_next_routine_clause(tokens, routine_index + 1, tokens.len());
+    (clause_start < tokens.len()).then_some(clause_start)
+}
+
+fn find_next_routine_clause(tokens: &[Token], start: usize, end: usize) -> usize {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().take(end).skip(start) {
+        match token.kind {
+            TokenKind::Punctuation('(')
+            | TokenKind::Punctuation('[')
+            | TokenKind::Punctuation('{') => depth += 1,
+            TokenKind::Punctuation(')')
+            | TokenKind::Punctuation(']')
+            | TokenKind::Punctuation('}') => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 && is_routine_clause_start(tokens, idx) => return idx,
+            _ => {}
+        }
+    }
+    end
+}
+
+fn find_plpgsql_boolean_segment_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (idx, token) in tokens.iter().enumerate().skip(start) {
+        match token.kind {
+            TokenKind::Punctuation('(')
+            | TokenKind::Punctuation('[')
+            | TokenKind::Punctuation('{') => depth += 1,
+            TokenKind::Punctuation(')')
+            | TokenKind::Punctuation(']')
+            | TokenKind::Punctuation('}') => depth = depth.saturating_sub(1),
+            TokenKind::Punctuation(';') if depth == 0 => return idx,
+            TokenKind::Word if depth == 0 => {
+                let upper = token.upper();
+                if matches!(
+                    upper.as_str(),
+                    "THEN" | "LOOP" | "ELSE" | "ELSIF" | "WHEN" | "EXCEPTION"
+                ) {
+                    return idx;
+                }
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+fn is_routine_clause_start(tokens: &[Token], idx: usize) -> bool {
+    let token = &tokens[idx];
+    if !token.is_word() {
+        return false;
+    }
+
+    let upper = token.upper();
+    match upper.as_str() {
+        "RETURNS" | "LANGUAGE" | "TRANSFORM" | "WINDOW" | "IMMUTABLE" | "STABLE" | "VOLATILE"
+        | "LEAKPROOF" | "STRICT" | "SECURITY" | "PARALLEL" | "COST" | "ROWS" | "SUPPORT"
+        | "SET" | "AS" => true,
+        "CALLED" => tokens
+            .get(idx + 1)
+            .is_some_and(|token| token.is_word() && token.upper() == "ON"),
+        "EXTERNAL" => tokens
+            .get(idx + 1)
+            .is_some_and(|token| token.is_word() && token.upper() == "SECURITY"),
+        "NOT" => tokens
+            .get(idx + 1)
+            .is_some_and(|token| token.is_word() && token.upper() == "LEAKPROOF"),
+        _ => false,
+    }
 }
 
 fn create_trigger_name_index(tokens: &[Token]) -> Option<(usize, usize)> {
@@ -2182,6 +2498,12 @@ fn format_inline_tokens(
                 trim_inline_spaces(&mut out);
                 out.push_str("::");
             }
+            TokenKind::Operator
+                if token.text == "%" && next.is_some_and(is_plpgsql_percent_type_word) =>
+            {
+                trim_inline_spaces(&mut out);
+                out.push('%');
+            }
             TokenKind::Operator => {
                 inline_space(&mut out, token, tokens.get(idx.wrapping_sub(1)));
                 out.push_str(&token.text);
@@ -2248,6 +2570,10 @@ fn is_probable_function_signature_type(token: &Token, next: Option<&Token>) -> b
     keywords::is_type(&token.upper()) && !next.is_some_and(|next| next.is_punctuation('('))
 }
 
+fn is_plpgsql_percent_type_word(token: &Token) -> bool {
+    token.is_word() && matches!(token.upper().as_str(), "TYPE" | "ROWTYPE")
+}
+
 fn inline_space(out: &mut String, token: &Token, previous: Option<&Token>) {
     if out.is_empty() {
         return;
@@ -2262,6 +2588,13 @@ fn inline_space(out: &mut String, token: &Token, previous: Option<&Token>) {
                     | TokenKind::Punctuation('{')
             )
     }) {
+        trim_inline_spaces(out);
+        return;
+    }
+    if token.kind == TokenKind::Word
+        && is_plpgsql_percent_type_word(token)
+        && previous.is_some_and(|previous| previous.text == "%")
+    {
         trim_inline_spaces(out);
         return;
     }
@@ -2500,6 +2833,72 @@ mod tests {
         let formatted = format_sql(sql);
         assert!(formatted.contains("$$\n  BEGIN\n    IF TRUE THEN"));
         assert!(formatted.contains("RAISE NOTICE 'ok';"));
+    }
+
+    #[test]
+    fn formats_create_function_options_on_separate_lines() {
+        let sql = "create or replace function audit_member_role() returns trigger language plpgsql security definer set search_path = pg_catalog, public as $$begin return new; end;$$;";
+        let formatted = format_sql(sql);
+        assert!(formatted.contains(
+            "CREATE OR REPLACE FUNCTION audit_member_role()\nRETURNS TRIGGER\nLANGUAGE plpgsql\nSECURITY DEFINER\nSET search_path = pg_catalog, public\nAS\n$$\n  BEGIN\n    RETURN NEW;\n  END;\n$$;"
+        ));
+        assert!(!formatted.contains("RETURNS TRIGGER LANGUAGE"));
+    }
+
+    #[test]
+    fn formats_plpgsql_trigger_audit_function_contexts() {
+        let sql = "create or replace function auth_audit_organization_change() returns trigger language plpgsql security definer set search_path = pg_catalog, public as $$ declare row_data auth_organization % ROWTYPE; action_name text; begin row_data := coalesce(new, old); if tg_op = 'INSERT' then action_name := 'org.create'; elsif tg_op = 'DELETE' then action_name := 'org.delete'; elsif new.delete_time is distinct from old.delete_time and new.delete_time is not null then action_name := 'org.delete'; else action_name := 'org.update'; end if; insert into auth_audit_log(actor_id, organization_id, ACTION, resource, result, metadata) values(current_actor(), row_data.id, action_name, 'auth_organization:' || row_data.id, 'success', jsonb_build_object('slug', row_data.slug)); return row_data; end; $$;";
+        let formatted = format_sql(sql);
+        assert!(formatted.contains(
+            "CREATE OR REPLACE FUNCTION auth_audit_organization_change()\nRETURNS TRIGGER\nLANGUAGE plpgsql\nSECURITY DEFINER\nSET search_path = pg_catalog, public\nAS"
+        ));
+        assert!(formatted.contains("row_data auth_organization%ROWTYPE;"));
+        assert!(formatted.contains(
+            "ELSIF NEW.delete_time IS DISTINCT FROM OLD.delete_time AND NEW.delete_time IS NOT NULL THEN"
+        ));
+        assert!(formatted.contains("\n      action,\n"));
+        assert!(!formatted.contains(" % ROWTYPE"));
+        assert!(!formatted.contains("IS DISTINCT\n    FROM"));
+        assert!(!formatted.contains("\n      ACTION,\n"));
+    }
+
+    #[test]
+    fn formats_insert_target_keyword_identifiers() {
+        let sql = "insert into sample_measurement_sets (sample_id, source, VALUES, checks, measured_time, creator_id) values (@sample_id, @source, @values, @checks, @measured_time, @creator_id) returning id, VALUES, checks; select id, VALUES, checks from sample_measurement_sets;";
+        let formatted = format_sql(sql);
+        assert!(formatted.contains(
+            "INSERT INTO sample_measurement_sets (\n  sample_id,\n  source,\n  values,\n  checks,"
+        ));
+        assert!(formatted.contains("RETURNING\n  id,\n  values,\n  checks;"));
+        assert!(formatted.contains("SELECT\n  id,\n  values,\n  checks\nFROM"));
+        assert!(!formatted.contains("\n  VALUES,\n"));
+        assert!(!formatted.contains("VALUES\n,"));
+    }
+
+    #[test]
+    fn wraps_long_parenthesized_comma_groups() {
+        let options = FormatOptions {
+            wrap_limit: Some(70),
+            ..FormatOptions::default()
+        };
+        let sql = "select jsonb_build_object('first_key','aaaaaaaaaaaaaaaaaaaa','second_key','bbbbbbbbbbbbbbbbbbbb') as payload;";
+        let formatted = format_sql_with_options(sql, &options);
+        assert!(formatted.contains(
+            "jsonb_build_object(\n    'first_key',\n    'aaaaaaaaaaaaaaaaaaaa',\n    'second_key',\n    'bbbbbbbbbbbbbbbbbbbb'\n  ) AS payload"
+        ));
+    }
+
+    #[test]
+    fn wraps_long_plpgsql_boolean_segments() {
+        let options = FormatOptions {
+            wrap_limit: Some(80),
+            ..FormatOptions::default()
+        };
+        let sql = "create function f() returns void language plpgsql as $$begin if new.delete_time is distinct from old.delete_time and new.delete_time is not null then return; end if; end$$;";
+        let formatted = format_sql_with_options(sql, &options);
+        assert!(formatted.contains(
+            "IF NEW.delete_time IS DISTINCT FROM OLD.delete_time\n      AND NEW.delete_time IS NOT NULL THEN"
+        ));
     }
 
     #[test]
